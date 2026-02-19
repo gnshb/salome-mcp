@@ -67,29 +67,7 @@ cp salome_bridge.py ~/.config/salome/Plugins/
 claude mcp add salome uv run --directory /absolute/path/to/salome-mcp salome-mcp
 ```
 
-## GUI Usage Guide
-Menu path: `Tools -> Plugins -> MCP Bridge`
-
-### `Start (default)`
-1. Tries default host/port (`localhost:1234`).
-2. If unavailable, prompts for a port.
-
-### `Start (choose host and port)`
-1. Prompts for host and port immediately.
-2. Use when you want a fixed non-default port.
-
-### `Status`
-Shows current bridge state and connection hint.
-
-### `Stop`
-Stops bridge and closes the listening socket.
-
-### Status badge meanings
-1. `MCP Bridge: STARTING host:port` - bridge startup in progress.
-2. `MCP Bridge: RUNNING host:port` - bridge ready.
-3. `MCP Bridge: STOPPED` - bridge not running.
-
-## Workflow
+# Workflow
 1. Start SALOME.
 2. In GUI: `MCP Bridge -> Start (default)`.
 3. Start/open your MCP agent client.
