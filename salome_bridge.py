@@ -1,0 +1,1396 @@
+#!/usr/bin/env python3
+"""Socket bridge to expose SALOME GUI operations to an external MCP server."""
+
+import io
+import json
+import logging
+import math
+import os
+import socket
+import threading
+import traceback
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+logger = logging.getLogger("SalomeBridge")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    )
+    logger.addHandler(_handler)
+
+DEFAULT_HOST = "localhost"
+DEFAULT_PORT = 1234
+
+
+class SalomeRuntime:
+    """SALOME API wrapper with persistent runtime state."""
+
+    def __init__(self) -> None:
+        self.exec_globals: Dict[str, Any] = {}
+        self._initialized = False
+        self._meshes_by_name: Dict[str, Any] = {}
+
+    def initialize(self) -> None:
+        if self._initialized:
+            return
+
+        import salome  # type: ignore
+
+        salome.salome_init()
+        self._ensure_gui_session(salome)
+        self.exec_globals["salome"] = salome
+
+        try:
+            from salome.geom import geomBuilder  # type: ignore
+
+            self.exec_globals["geomBuilder"] = geomBuilder
+            self.exec_globals["geompy"] = geomBuilder.New()
+        except Exception as exc:  # pragma: no cover - depends on SALOME modules
+            logger.warning("Could not initialize GEOM module: %s", exc)
+
+        try:
+            import SMESH  # type: ignore
+            from salome.smesh import smeshBuilder  # type: ignore
+
+            self.exec_globals["SMESH"] = SMESH
+            self.exec_globals["smeshBuilder"] = smeshBuilder
+            self.exec_globals["smesh"] = smeshBuilder.New()
+        except Exception as exc:  # pragma: no cover - depends on SALOME modules
+            logger.warning("Could not initialize SMESH module: %s", exc)
+
+        self._initialized = True
+        logger.info("SALOME runtime initialized")
+
+    @staticmethod
+    def _ensure_gui_session(salome_module: Any) -> None:
+        try:
+            has_desktop = bool(salome_module.sg.hasDesktop())
+        except Exception:
+            has_desktop = False
+
+        if not has_desktop:
+            raise RuntimeError(
+                "Headless SALOME bridge is disabled. Start bridge from SALOME GUI plugin."
+            )
+
+    def _refresh_gui(self) -> None:
+        salome = self.exec_globals.get("salome")
+        if not salome:
+            return
+        try:
+            if salome.sg.hasDesktop():
+                salome.sg.updateObjBrowser()
+        except Exception:
+            pass
+
+    def _iter_component_sobjects(self, component: str, include_nested: bool = True) -> List[Any]:
+        self.initialize()
+        salome = self.exec_globals["salome"]
+        study = salome.myStudy
+        out: List[Any] = []
+
+        def collect_children(parent: Any) -> None:
+            child_iter = study.NewChildIterator(parent)
+            while child_iter.More():
+                child = child_iter.Value()
+                child_iter.Next()
+                out.append(child)
+                if include_nested:
+                    collect_children(child)
+
+        comp_iter = study.NewComponentIterator()
+        while comp_iter.More():
+            comp_sobj = comp_iter.Value()
+            comp_iter.Next()
+            comp_name = comp_sobj.ComponentDataType() if hasattr(comp_sobj, "ComponentDataType") else ""
+            if comp_name != component:
+                continue
+            collect_children(comp_sobj)
+
+        return out
+
+    @staticmethod
+    def _sobj_entry(sobj: Any) -> str:
+        if hasattr(sobj, "GetID"):
+            return sobj.GetID()
+        return ""
+
+    @staticmethod
+    def _sobj_name(sobj: Any) -> str:
+        if hasattr(sobj, "GetName"):
+            return sobj.GetName()
+        return ""
+
+    def _lookup_entry_by_name(self, component: str, name: str) -> Optional[str]:
+        for sobj in self._iter_component_sobjects(component):
+            if self._sobj_name(sobj) == name:
+                entry = self._sobj_entry(sobj)
+                if entry:
+                    return entry
+        return None
+
+    def _object_from_entry(self, entry: str) -> Any:
+        salome = self.exec_globals["salome"]
+        try:
+            return salome.IDToObject(entry)
+        except Exception:
+            return None
+
+    def _resolve_shape(self, reference: str) -> Tuple[Any, str, str]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        ref = reference.strip()
+        obj = self._object_from_entry(ref)
+        entry = ref if obj is not None else ""
+
+        if obj is None:
+            entry = self._lookup_entry_by_name("GEOM", ref)
+            if entry:
+                obj = self._object_from_entry(entry)
+
+        if obj is None:
+            try:
+                obj = geompy.GetObject(ref)
+            except Exception:
+                obj = None
+
+        if obj is None:
+            raise RuntimeError(f"GEOM object not found: {reference}")
+
+        name = ref
+        if entry:
+            sobj = self.exec_globals["salome"].myStudy.FindObjectID(entry)
+            if sobj is not None:
+                name = self._sobj_name(sobj) or name
+
+        return obj, entry, name
+
+    @staticmethod
+    def _extract_first_mesh(value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            if not value:
+                return None
+            return SalomeRuntime._extract_first_mesh(value[0])
+        return value
+
+    def _register_mesh(self, mesh: Any, name: Optional[str] = None) -> str:
+        mesh_name = name or ""
+        if not mesh_name:
+            try:
+                mesh_name = mesh.GetName()
+            except Exception:
+                mesh_name = ""
+
+        if not mesh_name:
+            mesh_name = f"Mesh_{len(self._meshes_by_name) + 1}"
+
+        self._meshes_by_name[mesh_name] = mesh
+
+        smesh = self.exec_globals.get("smesh")
+        try:
+            if smesh is not None:
+                smesh.SetName(mesh.GetMesh(), mesh_name)
+        except Exception:
+            pass
+
+        return mesh_name
+
+    def _resolve_mesh(self, reference: str) -> Tuple[Any, str]:
+        self.initialize()
+
+        ref = reference.strip()
+        if ref in self._meshes_by_name:
+            return self._meshes_by_name[ref], ref
+
+        obj = self._object_from_entry(ref)
+        if obj is not None and hasattr(obj, "NbNodes"):
+            name = ref
+            try:
+                name = obj.GetName() or ref
+            except Exception:
+                pass
+            self._meshes_by_name[name] = obj
+            return obj, name
+
+        entry = self._lookup_entry_by_name("SMESH", ref)
+        if entry:
+            obj = self._object_from_entry(entry)
+            if obj is not None and hasattr(obj, "NbNodes"):
+                self._meshes_by_name[ref] = obj
+                return obj, ref
+
+        raise RuntimeError(f"Mesh not found: {reference}")
+
+    @staticmethod
+    def _normalized_format(filepath: str, requested: str = "auto") -> str:
+        if requested and requested.lower() != "auto":
+            return requested.lower()
+
+        ext = Path(filepath).suffix.lower()
+        mapping = {
+            ".brep": "brep",
+            ".step": "step",
+            ".stp": "step",
+            ".iges": "iges",
+            ".igs": "iges",
+            ".stl": "stl",
+            ".med": "med",
+            ".unv": "unv",
+            ".cgns": "cgns",
+            ".mesh": "mesh",
+            ".meshb": "mesh",
+        }
+        if ext in mapping:
+            return mapping[ext]
+        raise RuntimeError(f"Unsupported file extension: {ext}")
+
+    def ping(self) -> Dict[str, Any]:
+        self.initialize()
+        return {"message": "SALOME bridge is connected"}
+
+    def get_study_info(self) -> Dict[str, Any]:
+        self.initialize()
+        salome = self.exec_globals["salome"]
+        study = salome.myStudy
+
+        components: List[str] = []
+        iterator = study.NewComponentIterator()
+        while iterator.More():
+            component = iterator.Value()
+            iterator.Next()
+            components.append(component.ComponentDataType())
+
+        return {
+            "study_name": study._get_Name() if hasattr(study, "_get_Name") else "",
+            "component_count": len(components),
+            "components": components,
+        }
+
+    def list_study_objects(self, component: Optional[str], limit: int) -> Dict[str, Any]:
+        self.initialize()
+        salome = self.exec_globals["salome"]
+        study = salome.myStudy
+        objects: List[Dict[str, str]] = []
+
+        comp_iter = study.NewComponentIterator()
+        while comp_iter.More():
+            comp_sobj = comp_iter.Value()
+            comp_iter.Next()
+
+            comp_name = comp_sobj.ComponentDataType() if hasattr(comp_sobj, "ComponentDataType") else ""
+            if component and comp_name != component:
+                continue
+
+            for sobj in self._iter_component_sobjects(comp_name):
+                objects.append(
+                    {
+                        "component": comp_name,
+                        "entry": self._sobj_entry(sobj),
+                        "name": self._sobj_name(sobj),
+                    }
+                )
+                if len(objects) >= limit:
+                    return {"count": len(objects), "truncated": True, "objects": objects}
+
+        return {"count": len(objects), "truncated": False, "objects": objects}
+
+    def get_scene_summary(self, limit_per_component: int) -> Dict[str, Any]:
+        self.initialize()
+        geom_objects = self.list_study_objects("GEOM", limit_per_component)
+        mesh_objects = self.list_study_objects("SMESH", limit_per_component)
+        info = self.get_study_info()
+        return {
+            "study": info,
+            "geom": geom_objects,
+            "smesh": mesh_objects,
+        }
+
+    def create_box(self, dx: float, dy: float, dz: float, name: str) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape = geompy.MakeBoxDXDYDZ(dx, dy, dz)
+        entry = geompy.addToStudy(shape, name)
+        self._refresh_gui()
+        return {
+            "message": f"Created box '{name}'",
+            "entry": entry,
+            "dimensions": {"dx": dx, "dy": dy, "dz": dz},
+        }
+
+    def create_cylinder(self, radius: float, height: float, name: str) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape = geompy.MakeCylinderRH(radius, height)
+        entry = geompy.addToStudy(shape, name)
+        self._refresh_gui()
+        return {
+            "message": f"Created cylinder '{name}'",
+            "entry": entry,
+            "parameters": {"radius": radius, "height": height},
+        }
+
+    def create_sphere(self, radius: float, name: str) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape = geompy.MakeSphereR(radius)
+        entry = geompy.addToStudy(shape, name)
+        self._refresh_gui()
+        return {
+            "message": f"Created sphere '{name}'",
+            "entry": entry,
+            "parameters": {"radius": radius},
+        }
+
+    def fuse_objects(
+        self,
+        base_object: str,
+        tool_objects: Sequence[str],
+        result_name: str,
+    ) -> Dict[str, Any]:
+        return self.boolean_operation("fuse", base_object, tool_objects, result_name)
+
+    def cut_objects(
+        self,
+        base_object: str,
+        tool_objects: Sequence[str],
+        result_name: str,
+    ) -> Dict[str, Any]:
+        return self.boolean_operation("cut", base_object, tool_objects, result_name)
+
+    def common_objects(
+        self,
+        base_object: str,
+        tool_objects: Sequence[str],
+        result_name: str,
+    ) -> Dict[str, Any]:
+        return self.boolean_operation("common", base_object, tool_objects, result_name)
+
+    def copy_object(self, source_ref: str, name: str) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(source_ref)
+        try:
+            copied = geompy.MakeCopy(shape)
+        except Exception:
+            copied = geompy.MakeTranslation(shape, 0.0, 0.0, 0.0)
+
+        entry = geompy.addToStudy(copied, name)
+        self._refresh_gui()
+        return {
+            "message": f"Created copy '{name}'",
+            "entry": entry,
+            "source": source_ref,
+        }
+
+    def duplicate_object(
+        self,
+        source_ref: str,
+        count: int,
+        name_prefix: Optional[str],
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+        if count < 1:
+            raise RuntimeError("count must be >= 1")
+
+        shape, _, source_name = self._resolve_shape(source_ref)
+        prefix = (name_prefix or f"{source_name}_copy").strip()
+        if not prefix:
+            prefix = "Copy"
+
+        items: List[Dict[str, Any]] = []
+        for idx in range(count):
+            copy_name = f"{prefix}_{idx + 1}"
+            try:
+                copied = geompy.MakeCopy(shape)
+            except Exception:
+                copied = geompy.MakeTranslation(shape, 0.0, 0.0, 0.0)
+            entry = geompy.addToStudy(copied, copy_name)
+            items.append({"name": copy_name, "entry": entry})
+
+        self._refresh_gui()
+        return {
+            "message": f"Created {count} duplicate(s) from '{source_ref}'",
+            "source": source_ref,
+            "count": count,
+            "items": items,
+        }
+
+    def translate_object(
+        self,
+        source_ref: str,
+        dx: float,
+        dy: float,
+        dz: float,
+        result_name: str,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(source_ref)
+        try:
+            translated = geompy.MakeTranslation(shape, float(dx), float(dy), float(dz))
+        except TypeError:
+            vector = geompy.MakeVectorDXDYDZ(float(dx), float(dy), float(dz))
+            translated = geompy.MakeTranslationVector(shape, vector)
+
+        entry = geompy.addToStudy(translated, result_name)
+        self._refresh_gui()
+        return {
+            "message": f"Created translation '{result_name}'",
+            "entry": entry,
+            "source": source_ref,
+            "offset": {"dx": float(dx), "dy": float(dy), "dz": float(dz)},
+        }
+
+    def rotate_object(
+        self,
+        source_ref: str,
+        angle_degrees: float,
+        axis: str,
+        result_name: str,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        axis_key = axis.upper().strip()
+        axis_map = {
+            "X": (1.0, 0.0, 0.0),
+            "Y": (0.0, 1.0, 0.0),
+            "Z": (0.0, 0.0, 1.0),
+        }
+        if axis_key not in axis_map:
+            raise RuntimeError("axis must be one of: X, Y, Z")
+
+        shape, _, _ = self._resolve_shape(source_ref)
+        axis_vec = geompy.MakeVectorDXDYDZ(*axis_map[axis_key])
+        angle_radians = math.radians(float(angle_degrees))
+        rotated = geompy.MakeRotation(shape, axis_vec, angle_radians)
+
+        entry = geompy.addToStudy(rotated, result_name)
+        self._refresh_gui()
+        return {
+            "message": f"Created rotation '{result_name}'",
+            "entry": entry,
+            "source": source_ref,
+            "axis": axis_key,
+            "angle_degrees": float(angle_degrees),
+            "angle_radians": angle_radians,
+        }
+
+    def rename_object(self, object_ref: str, new_name: str) -> Dict[str, Any]:
+        self.initialize()
+        salome = self.exec_globals["salome"]
+
+        shape, entry, old_name = self._resolve_shape(object_ref)
+        if not entry:
+            raise RuntimeError(
+                "Unable to rename object without study entry. Use an entry or a study object name."
+            )
+
+        sobj = salome.myStudy.FindObjectID(entry)
+        renamed = False
+        if sobj is not None:
+            try:
+                sobj.SetName(new_name)
+                renamed = True
+            except Exception:
+                pass
+
+            if not renamed:
+                try:
+                    builder = salome.myStudy.NewBuilder()
+                    builder.SetName(sobj, new_name)
+                    renamed = True
+                except Exception:
+                    pass
+
+        if not renamed:
+            try:
+                shape.SetName(new_name)
+                renamed = True
+            except Exception:
+                pass
+
+        if not renamed:
+            raise RuntimeError("Failed to rename object in study")
+
+        self._refresh_gui()
+        return {
+            "message": f"Renamed object to '{new_name}'",
+            "entry": entry,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+
+    def get_object_info(self, object_ref: str, precise_bbox: bool) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, entry, name = self._resolve_shape(object_ref)
+        bbox = geompy.BoundingBox(shape, bool(precise_bbox))
+        props = geompy.BasicProperties(shape)
+        what_is = geompy.WhatIs(shape)
+
+        counts: Dict[str, int] = {}
+        for kind in ("VERTEX", "EDGE", "FACE", "SOLID"):
+            try:
+                counts[kind] = int(geompy.NbShapes(shape, geompy.ShapeType[kind]))
+            except Exception:
+                counts[kind] = 0
+
+        shape_type = None
+        try:
+            shape_type = int(shape.GetShapeType())
+        except Exception:
+            pass
+
+        return {
+            "object_ref": object_ref,
+            "resolved_name": name,
+            "entry": entry,
+            "shape_type": shape_type,
+            "what_is": what_is,
+            "basic_properties": {
+                "length": float(props[0]),
+                "area": float(props[1]),
+                "volume": float(props[2]),
+            },
+            "bounding_box": {
+                "xmin": float(bbox[0]),
+                "xmax": float(bbox[1]),
+                "ymin": float(bbox[2]),
+                "ymax": float(bbox[3]),
+                "zmin": float(bbox[4]),
+                "zmax": float(bbox[5]),
+                "precise": bool(precise_bbox),
+            },
+            "subshape_counts": counts,
+        }
+
+    def delete_object(self, object_ref: str, with_children: bool) -> Dict[str, Any]:
+        self.initialize()
+        salome = self.exec_globals["salome"]
+
+        _, entry, name = self._resolve_shape(object_ref)
+        if not entry:
+            raise RuntimeError(
+                "Unable to delete object without study entry. Use an entry or a study object name."
+            )
+
+        study = salome.myStudy
+        sobj = study.FindObjectID(entry)
+        if sobj is None:
+            raise RuntimeError(f"Study object not found for entry: {entry}")
+
+        builder = study.NewBuilder()
+        if with_children and hasattr(builder, "RemoveObjectWithChildren"):
+            builder.RemoveObjectWithChildren(sobj)
+        else:
+            builder.RemoveObject(sobj)
+
+        self._refresh_gui()
+        return {
+            "message": f"Deleted object '{name}'",
+            "entry": entry,
+            "with_children": bool(with_children),
+        }
+
+    def boolean_operation(
+        self,
+        operation: str,
+        base_object: str,
+        tool_objects: Sequence[str],
+        result_name: str,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        base_shape, _, _ = self._resolve_shape(base_object)
+        tool_shapes = [self._resolve_shape(ref)[0] for ref in tool_objects]
+        op = operation.lower().strip()
+
+        if not tool_shapes:
+            raise RuntimeError("At least one tool object is required")
+
+        if op == "fuse":
+            result = geompy.MakeFuseList([base_shape] + tool_shapes)
+        elif op == "cut":
+            result = geompy.MakeCutList(base_shape, tool_shapes, True)
+        elif op == "common":
+            result = geompy.MakeCommonList([base_shape] + tool_shapes)
+        else:
+            raise RuntimeError(f"Unsupported boolean operation: {operation}")
+
+        entry = geompy.addToStudy(result, result_name)
+        self._refresh_gui()
+        return {
+            "message": f"Created boolean {op} '{result_name}'",
+            "entry": entry,
+            "operation": op,
+            "base": base_object,
+            "tools": list(tool_objects),
+        }
+
+    def list_subshapes(
+        self,
+        shape_ref: str,
+        subshape_type: str,
+        sorted_centres: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        shape_type_key = subshape_type.upper().strip()
+        if shape_type_key not in geompy.ShapeType:
+            raise RuntimeError(f"Unsupported subshape type: {subshape_type}")
+
+        shape_type = geompy.ShapeType[shape_type_key]
+        if sorted_centres:
+            subs = geompy.SubShapeAllSortedCentres(shape, shape_type)
+        else:
+            subs = geompy.SubShapeAll(shape, shape_type)
+
+        items: List[Dict[str, int]] = []
+        for idx, sub in enumerate(subs):
+            sub_id = int(geompy.GetSubShapeID(shape, sub))
+            items.append({"index": idx, "id": sub_id})
+
+        return {
+            "shape": shape_ref,
+            "subshape_type": shape_type_key,
+            "count": len(items),
+            "items": items,
+        }
+
+    def create_group(
+        self,
+        shape_ref: str,
+        subshape_type: str,
+        subshape_ids: Sequence[int],
+        name: str,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        shape_type_key = subshape_type.upper().strip()
+        if shape_type_key not in geompy.ShapeType:
+            raise RuntimeError(f"Unsupported subshape type: {subshape_type}")
+
+        group = geompy.CreateGroup(shape, geompy.ShapeType[shape_type_key])
+        geompy.UnionIDs(group, [int(i) for i in subshape_ids])
+
+        if hasattr(geompy, "addToStudyInFather"):
+            entry = geompy.addToStudyInFather(shape, group, name)
+        else:
+            entry = geompy.addToStudy(group, name)
+
+        self._refresh_gui()
+        return {
+            "message": f"Created group '{name}'",
+            "entry": entry,
+            "shape": shape_ref,
+            "subshape_type": shape_type_key,
+            "subshape_ids": [int(i) for i in subshape_ids],
+        }
+
+    def create_surface_group(
+        self,
+        shape_ref: str,
+        subshape_ids: Sequence[int],
+        name: str,
+    ) -> Dict[str, Any]:
+        return self.create_group(shape_ref, "FACE", subshape_ids, name)
+
+    def create_volume_group(
+        self,
+        shape_ref: str,
+        subshape_ids: Sequence[int],
+        name: str,
+    ) -> Dict[str, Any]:
+        return self.create_group(shape_ref, "SOLID", subshape_ids, name)
+
+    def make_partition(
+        self,
+        object_refs: Sequence[str],
+        tool_refs: Sequence[str],
+        result_name: str,
+        shape_type: str,
+        keep_non_limit_shapes: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        objects = [self._resolve_shape(ref)[0] for ref in object_refs]
+        tools = [self._resolve_shape(ref)[0] for ref in tool_refs]
+        if not objects:
+            raise RuntimeError("At least one object is required for partition")
+
+        shape_type_key = shape_type.upper().strip() if shape_type else "SOLID"
+
+        try:
+            result = geompy.MakePartition(
+                objects,
+                tools,
+                [],
+                [],
+                geompy.ShapeType[shape_type_key],
+                0,
+                [],
+                0,
+                KeepNonlimitShapes=1 if keep_non_limit_shapes else 0,
+            )
+        except Exception:
+            result = geompy.MakePartition(objects, tools)
+
+        entry = geompy.addToStudy(result, result_name)
+        self._refresh_gui()
+        return {
+            "message": f"Created partition '{result_name}'",
+            "entry": entry,
+            "objects": list(object_refs),
+            "tools": list(tool_refs),
+            "shape_type": shape_type_key,
+        }
+
+    def explode_shape(
+        self,
+        shape_ref: str,
+        subshape_type: str,
+        result_prefix: str,
+        add_to_study: bool,
+        sorted_centres: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        shape_type_key = subshape_type.upper().strip()
+        if shape_type_key not in geompy.ShapeType:
+            raise RuntimeError(f"Unsupported subshape type: {subshape_type}")
+
+        shape_type = geompy.ShapeType[shape_type_key]
+        if sorted_centres:
+            subs = geompy.SubShapeAllSortedCentres(shape, shape_type)
+        else:
+            subs = geompy.SubShapeAll(shape, shape_type)
+
+        exploded: List[Dict[str, Any]] = []
+        for idx, sub in enumerate(subs):
+            sub_id = int(geompy.GetSubShapeID(shape, sub))
+            item: Dict[str, Any] = {"index": idx, "id": sub_id}
+            if add_to_study:
+                sub_name = f"{result_prefix}_{idx + 1}"
+                if hasattr(geompy, "addToStudyInFather"):
+                    entry = geompy.addToStudyInFather(shape, sub, sub_name)
+                else:
+                    entry = geompy.addToStudy(sub, sub_name)
+                item["entry"] = entry
+                item["name"] = sub_name
+            exploded.append(item)
+
+        self._refresh_gui()
+        return {
+            "shape": shape_ref,
+            "subshape_type": shape_type_key,
+            "count": len(exploded),
+            "items": exploded,
+        }
+
+    def import_geometry(
+        self,
+        filepath: str,
+        fmt: str,
+        name: Optional[str],
+        ignore_units: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        fmt_norm = self._normalized_format(filepath, fmt)
+
+        if fmt_norm == "brep":
+            shape = geompy.ImportBREP(filepath)
+        elif fmt_norm == "step":
+            try:
+                shape = geompy.ImportSTEP(filepath, bool(ignore_units))
+            except TypeError:
+                shape = geompy.ImportSTEP(filepath)
+        elif fmt_norm == "iges":
+            try:
+                shape = geompy.ImportIGES(filepath, bool(ignore_units))
+            except TypeError:
+                shape = geompy.ImportIGES(filepath)
+        else:
+            raise RuntimeError(f"Unsupported geometry import format: {fmt_norm}")
+
+        obj_name = name or f"Imported_{Path(filepath).stem}"
+        entry = geompy.addToStudy(shape, obj_name)
+        self._refresh_gui()
+        return {
+            "message": f"Imported geometry '{obj_name}'",
+            "entry": entry,
+            "format": fmt_norm,
+            "filepath": filepath,
+        }
+
+    def export_geometry(
+        self,
+        shape_ref: str,
+        filepath: str,
+        fmt: str,
+        ascii_stl: bool,
+        stl_deflection: float,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        fmt_norm = self._normalized_format(filepath, fmt)
+
+        if fmt_norm == "brep":
+            geompy.ExportBREP(shape, filepath)
+        elif fmt_norm == "step":
+            geompy.ExportSTEP(shape, filepath)
+        elif fmt_norm == "iges":
+            geompy.ExportIGES(shape, filepath)
+        elif fmt_norm == "stl":
+            try:
+                geompy.ExportSTL(shape, filepath, bool(ascii_stl), float(stl_deflection))
+            except TypeError:
+                geompy.ExportSTL(shape, filepath, bool(ascii_stl))
+        else:
+            raise RuntimeError(f"Unsupported geometry export format: {fmt_norm}")
+
+        return {
+            "message": "Geometry exported",
+            "shape": shape_ref,
+            "format": fmt_norm,
+            "filepath": filepath,
+        }
+
+    def import_mesh(self, filepath: str, fmt: str, name: Optional[str]) -> Dict[str, Any]:
+        self.initialize()
+        smesh = self.exec_globals.get("smesh")
+        if smesh is None:
+            raise RuntimeError("SMESH is not available in this SALOME session")
+
+        fmt_norm = self._normalized_format(filepath, fmt)
+
+        if fmt_norm == "med":
+            meshes, status = smesh.CreateMeshesFromMED(filepath)
+            mesh = self._extract_first_mesh(meshes)
+            if not status:
+                raise RuntimeError("CreateMeshesFromMED returned unsuccessful status")
+        elif fmt_norm == "unv":
+            mesh = smesh.CreateMeshesFromUNV(filepath)
+        elif fmt_norm == "stl":
+            mesh = smesh.CreateMeshesFromSTL(filepath)
+        elif fmt_norm == "cgns":
+            meshes, status = smesh.CreateMeshesFromCGNS(filepath)
+            mesh = self._extract_first_mesh(meshes)
+            if not status:
+                raise RuntimeError("CreateMeshesFromCGNS returned unsuccessful status")
+        elif fmt_norm == "mesh":
+            mesh = smesh.CreateMeshesFromGMF(filepath)[0]
+        else:
+            raise RuntimeError(f"Unsupported mesh import format: {fmt_norm}")
+
+        if mesh is None:
+            raise RuntimeError("Imported mesh is empty")
+
+        mesh_name = self._register_mesh(mesh, name)
+        self._refresh_gui()
+        return {
+            "message": f"Imported mesh '{mesh_name}'",
+            "mesh_name": mesh_name,
+            "format": fmt_norm,
+            "filepath": filepath,
+        }
+
+    def export_mesh(
+        self,
+        mesh_ref: str,
+        filepath: str,
+        fmt: str,
+        ascii_stl: bool,
+        auto_dimension: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        mesh, mesh_name = self._resolve_mesh(mesh_ref)
+        fmt_norm = self._normalized_format(filepath, fmt)
+
+        if fmt_norm == "med":
+            try:
+                mesh.ExportMED(filepath, autoDimension=bool(auto_dimension))
+            except TypeError:
+                try:
+                    mesh.ExportMED(filepath, 0)
+                except TypeError:
+                    mesh.ExportMED(filepath)
+        elif fmt_norm == "unv":
+            mesh.ExportUNV(filepath)
+        elif fmt_norm == "stl":
+            mesh.ExportSTL(filepath, bool(ascii_stl))
+        else:
+            raise RuntimeError(f"Unsupported mesh export format: {fmt_norm}")
+
+        return {
+            "message": "Mesh exported",
+            "mesh": mesh_name,
+            "format": fmt_norm,
+            "filepath": filepath,
+        }
+
+    def create_mesh(
+        self,
+        shape_ref: str,
+        mesh_name: str,
+        segment_count: int,
+        max_element_area: Optional[float],
+        max_element_volume: Optional[float],
+        surface_algorithm: str,
+        volume_algorithm: str,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        smesh = self.exec_globals.get("smesh")
+        if smesh is None:
+            raise RuntimeError("SMESH is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        mesh = smesh.Mesh(shape, mesh_name)
+
+        if segment_count > 0:
+            algo_1d = mesh.Segment()
+            algo_1d.NumberOfSegments(int(segment_count))
+
+        surf_algo_name = surface_algorithm.lower().strip()
+        if surf_algo_name == "triangle":
+            algo_2d = mesh.Triangle()
+            if max_element_area is not None:
+                algo_2d.MaxElementArea(float(max_element_area))
+        elif surf_algo_name == "quadrangle":
+            mesh.Quadrangle()
+        elif surf_algo_name == "none":
+            pass
+        else:
+            raise RuntimeError(f"Unsupported surface_algorithm: {surface_algorithm}")
+
+        vol_algo_name = volume_algorithm.lower().strip()
+        if vol_algo_name in ("tetra", "tetrahedron"):
+            algo_3d = mesh.Tetrahedron()
+            if max_element_volume is not None:
+                algo_3d.MaxElementVolume(float(max_element_volume))
+        elif vol_algo_name in ("hexa", "hexahedron"):
+            mesh.Hexahedron()
+        elif vol_algo_name == "none":
+            pass
+        else:
+            raise RuntimeError(f"Unsupported volume_algorithm: {volume_algorithm}")
+
+        registered = self._register_mesh(mesh, mesh_name)
+        self._refresh_gui()
+        return {
+            "message": f"Created mesh definition '{registered}'",
+            "mesh_name": registered,
+            "shape": shape_ref,
+            "segment_count": int(segment_count),
+            "surface_algorithm": surf_algo_name,
+            "volume_algorithm": vol_algo_name,
+        }
+
+    def get_mesh_info(self, mesh_ref: str) -> Dict[str, Any]:
+        self.initialize()
+        smesh = self.exec_globals.get("smesh")
+        mesh, mesh_name = self._resolve_mesh(mesh_ref)
+
+        info = {
+            "mesh_name": mesh_name,
+            "nodes": int(mesh.NbNodes()) if hasattr(mesh, "NbNodes") else 0,
+            "edges": int(mesh.NbEdges()) if hasattr(mesh, "NbEdges") else 0,
+            "faces": int(mesh.NbFaces()) if hasattr(mesh, "NbFaces") else 0,
+            "volumes": int(mesh.NbVolumes()) if hasattr(mesh, "NbVolumes") else 0,
+            "triangles": int(mesh.NbTriangles()) if hasattr(mesh, "NbTriangles") else 0,
+            "quadrangles": int(mesh.NbQuadrangles()) if hasattr(mesh, "NbQuadrangles") else 0,
+            "tetrahedrons": int(mesh.NbTetras()) if hasattr(mesh, "NbTetras") else 0,
+            "hexahedrons": int(mesh.NbHexas()) if hasattr(mesh, "NbHexas") else 0,
+        }
+
+        detailed: Dict[str, int] = {}
+        if smesh is not None and hasattr(smesh, "GetMeshInfo"):
+            try:
+                raw = smesh.GetMeshInfo(mesh)
+                for key, value in raw.items():
+                    detailed[str(key)] = int(value)
+            except Exception:
+                detailed = {}
+
+        info["detailed"] = detailed
+        return info
+
+    def compute_mesh(self, mesh_ref: str) -> Dict[str, Any]:
+        self.initialize()
+        mesh, mesh_name = self._resolve_mesh(mesh_ref)
+        success = bool(mesh.Compute())
+        self._refresh_gui()
+
+        return {
+            "message": f"Computed mesh '{mesh_name}'" if success else f"Mesh compute failed for '{mesh_name}'",
+            "success": success,
+            "mesh": self.get_mesh_info(mesh_name),
+        }
+
+    def execute_code(self, code: str) -> Dict[str, Any]:
+        self.initialize()
+
+        stream = io.StringIO()
+        local_scope: Dict[str, Any] = {}
+
+        with redirect_stdout(stream):
+            exec(code, self.exec_globals, local_scope)
+
+        result_value = local_scope.get("result")
+        return {
+            "stdout": stream.getvalue(),
+            "result": repr(result_value),
+        }
+
+
+class SalomeBridgeServer:
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+        self.host = host
+        self.port = port
+        self.runtime = SalomeRuntime()
+        self.running = False
+        self.server_socket: Optional[socket.socket] = None
+        self.last_error: Optional[str] = None
+        self._start_cancelled = False
+        self._state_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._state_lock:
+            if self.running:
+                return
+            self.last_error = None
+            self._start_cancelled = False
+
+        try:
+            # Refuse to run in headless sessions.
+            self.runtime.initialize()
+
+            with self._state_lock:
+                if self._start_cancelled:
+                    logger.info(
+                        "SALOME bridge start cancelled before socket bind on %s:%s",
+                        self.host,
+                        self.port,
+                    )
+                    return
+                self.running = True
+
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(5)
+            self.server_socket.settimeout(1.0)
+        except Exception as exc:
+            self.last_error = str(exc)
+            logger.error(
+                "Failed to start SALOME bridge on %s:%s: %s",
+                self.host,
+                self.port,
+                exc,
+            )
+            self.running = False
+            if self.server_socket:
+                try:
+                    self.server_socket.close()
+                except Exception:
+                    pass
+                self.server_socket = None
+            return
+
+        logger.info("SALOME bridge listening on %s:%s", self.host, self.port)
+
+        try:
+            while self.running:
+                try:
+                    client, addr = self.server_socket.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self.running:
+                        logger.error("Bridge socket unexpectedly closed")
+                    break
+
+                logger.debug("Client connected from %s:%s", addr[0], addr[1])
+                thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client,),
+                    daemon=True,
+                )
+                thread.start()
+        finally:
+            self.stop()
+
+    def stop(self) -> None:
+        with self._state_lock:
+            self._start_cancelled = True
+            self.running = False
+            if self.server_socket:
+                try:
+                    self.server_socket.close()
+                except Exception:
+                    pass
+                self.server_socket = None
+        logger.info("SALOME bridge stopped")
+
+    def _handle_client(self, client: socket.socket) -> None:
+        buffer = b""
+        client.settimeout(None)
+
+        try:
+            while self.running:
+                data = client.recv(8192)
+                if not data:
+                    break
+
+                buffer += data
+                try:
+                    command = json.loads(buffer.decode("utf-8"))
+                    buffer = b""
+                except json.JSONDecodeError:
+                    continue
+
+                response = self._execute_command(command)
+                client.sendall(json.dumps(response).encode("utf-8"))
+        except Exception as exc:
+            logger.error("Client handling error: %s", exc)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _execute_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        command_type = command.get("type")
+        params = command.get("params", {})
+
+        handlers = {
+            "ping": lambda _params: self.runtime.ping(),
+            "get_study_info": lambda _params: self.runtime.get_study_info(),
+            "get_scene_summary": lambda p: self.runtime.get_scene_summary(
+                int(p.get("limit_per_component", 200))
+            ),
+            "list_study_objects": lambda p: self.runtime.list_study_objects(
+                p.get("component"), int(p.get("limit", 200))
+            ),
+            "create_box": lambda p: self.runtime.create_box(
+                float(p["dx"]), float(p["dy"]), float(p["dz"]), str(p.get("name", "Box"))
+            ),
+            "create_cylinder": lambda p: self.runtime.create_cylinder(
+                float(p["radius"]), float(p["height"]), str(p.get("name", "Cylinder"))
+            ),
+            "create_sphere": lambda p: self.runtime.create_sphere(
+                float(p["radius"]), str(p.get("name", "Sphere"))
+            ),
+            "boolean_operation": lambda p: self.runtime.boolean_operation(
+                str(p["operation"]),
+                str(p["base_object"]),
+                [str(x) for x in p.get("tool_objects", [])],
+                str(p.get("result_name", "BooleanResult")),
+            ),
+            "fuse_objects": lambda p: self.runtime.fuse_objects(
+                str(p["base_object"]),
+                [str(x) for x in p.get("tool_objects", [])],
+                str(p.get("result_name", "Fuse")),
+            ),
+            "cut_objects": lambda p: self.runtime.cut_objects(
+                str(p["base_object"]),
+                [str(x) for x in p.get("tool_objects", [])],
+                str(p.get("result_name", "Cut")),
+            ),
+            "common_objects": lambda p: self.runtime.common_objects(
+                str(p["base_object"]),
+                [str(x) for x in p.get("tool_objects", [])],
+                str(p.get("result_name", "Common")),
+            ),
+            "copy_object": lambda p: self.runtime.copy_object(
+                str(p["source_ref"]),
+                str(p.get("name", "Copy")),
+            ),
+            "duplicate_object": lambda p: self.runtime.duplicate_object(
+                str(p["source_ref"]),
+                int(p.get("count", 1)),
+                p.get("name_prefix"),
+            ),
+            "translate_object": lambda p: self.runtime.translate_object(
+                str(p["source_ref"]),
+                float(p.get("dx", 0.0)),
+                float(p.get("dy", 0.0)),
+                float(p.get("dz", 0.0)),
+                str(p.get("result_name", "Translated")),
+            ),
+            "rotate_object": lambda p: self.runtime.rotate_object(
+                str(p["source_ref"]),
+                float(p["angle_degrees"]),
+                str(p.get("axis", "Z")),
+                str(p.get("result_name", "Rotated")),
+            ),
+            "rename_object": lambda p: self.runtime.rename_object(
+                str(p["object_ref"]),
+                str(p["new_name"]),
+            ),
+            "get_object_info": lambda p: self.runtime.get_object_info(
+                str(p["object_ref"]),
+                bool(p.get("precise_bbox", False)),
+            ),
+            "delete_object": lambda p: self.runtime.delete_object(
+                str(p["object_ref"]),
+                bool(p.get("with_children", True)),
+            ),
+            "list_subshapes": lambda p: self.runtime.list_subshapes(
+                str(p["shape_ref"]),
+                str(p.get("subshape_type", "FACE")),
+                bool(p.get("sorted_centres", True)),
+            ),
+            "create_group": lambda p: self.runtime.create_group(
+                str(p["shape_ref"]),
+                str(p["subshape_type"]),
+                [int(x) for x in p.get("subshape_ids", [])],
+                str(p.get("name", "Group")),
+            ),
+            "create_surface_group": lambda p: self.runtime.create_surface_group(
+                str(p["shape_ref"]),
+                [int(x) for x in p.get("subshape_ids", [])],
+                str(p.get("name", "SurfaceGroup")),
+            ),
+            "create_volume_group": lambda p: self.runtime.create_volume_group(
+                str(p["shape_ref"]),
+                [int(x) for x in p.get("subshape_ids", [])],
+                str(p.get("name", "VolumeGroup")),
+            ),
+            "make_partition": lambda p: self.runtime.make_partition(
+                [str(x) for x in p.get("object_refs", [])],
+                [str(x) for x in p.get("tool_refs", [])],
+                str(p.get("result_name", "Partition")),
+                str(p.get("shape_type", "SOLID")),
+                bool(p.get("keep_non_limit_shapes", False)),
+            ),
+            "explode_shape": lambda p: self.runtime.explode_shape(
+                str(p["shape_ref"]),
+                str(p.get("subshape_type", "FACE")),
+                str(p.get("result_prefix", "Exploded")),
+                bool(p.get("add_to_study", True)),
+                bool(p.get("sorted_centres", True)),
+            ),
+            "import_geometry": lambda p: self.runtime.import_geometry(
+                str(p["filepath"]),
+                str(p.get("format", "auto")),
+                p.get("name"),
+                bool(p.get("ignore_units", False)),
+            ),
+            "export_geometry": lambda p: self.runtime.export_geometry(
+                str(p["shape_ref"]),
+                str(p["filepath"]),
+                str(p.get("format", "auto")),
+                bool(p.get("ascii_stl", True)),
+                float(p.get("stl_deflection", 0.001)),
+            ),
+            "import_mesh": lambda p: self.runtime.import_mesh(
+                str(p["filepath"]),
+                str(p.get("format", "auto")),
+                p.get("name"),
+            ),
+            "export_mesh": lambda p: self.runtime.export_mesh(
+                str(p["mesh_ref"]),
+                str(p["filepath"]),
+                str(p.get("format", "auto")),
+                bool(p.get("ascii_stl", True)),
+                bool(p.get("auto_dimension", True)),
+            ),
+            "create_mesh": lambda p: self.runtime.create_mesh(
+                str(p["shape_ref"]),
+                str(p.get("mesh_name", "Mesh")),
+                int(p.get("segment_count", 10)),
+                None if p.get("max_element_area") is None else float(p.get("max_element_area")),
+                None
+                if p.get("max_element_volume") is None
+                else float(p.get("max_element_volume")),
+                str(p.get("surface_algorithm", "triangle")),
+                str(p.get("volume_algorithm", "tetrahedron")),
+            ),
+            "compute_mesh": lambda p: self.runtime.compute_mesh(str(p["mesh_ref"])),
+            "get_mesh_info": lambda p: self.runtime.get_mesh_info(str(p["mesh_ref"])),
+            "execute_code": lambda p: self.runtime.execute_code(str(p["code"])),
+        }
+
+        handler = handlers.get(command_type)
+        if handler is None:
+            return {
+                "status": "error",
+                "message": f"Unknown command type: {command_type}",
+            }
+
+        try:
+            result = handler(params)
+            return {"status": "success", "result": result}
+        except Exception as exc:
+            logger.error("Command '%s' failed: %s", command_type, exc)
+            logger.debug("%s", traceback.format_exc())
+            return {"status": "error", "message": str(exc)}
+
+
+def main() -> None:
+    host = os.getenv("SALOME_HOST", DEFAULT_HOST)
+    port = int(os.getenv("SALOME_PORT", DEFAULT_PORT))
+
+    server = SalomeBridgeServer(host=host, port=port)
+    server.start()
+
+
+if __name__ == "__main__":
+    main()

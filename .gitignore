@@ -1,0 +1,50 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build/packaging
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Test/coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environment files
+.env
+.env.*
+*.local
+local_settings.py
+
+# Potential credentials/keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs
+*.log
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+.ipynb_checkpoints/
+
+# Generated artifacts
+*.bak
+*.tmp
