@@ -5,6 +5,7 @@ import salome_pluginsmanager
 from mcp_port_plugin import (
     bridge_status,
     install_live_status_widget,
+    install_quit_hook,
     start_bridge_default,
     start_bridge_dialog,
     stop_bridge,
@@ -12,6 +13,7 @@ from mcp_port_plugin import (
 
 # Try to show the live status badge immediately when plugin is loaded.
 install_live_status_widget()
+install_quit_hook()
 
 salome_pluginsmanager.AddFunction(
     "MCP Bridge/Start (default)",

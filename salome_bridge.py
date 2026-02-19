@@ -207,7 +207,9 @@ class SalomeRuntime:
 
         ref = reference.strip()
         if ref in self._meshes_by_name:
-            return self._meshes_by_name[ref], ref
+            mesh_obj = self._coerce_mesh_wrapper(self._meshes_by_name[ref])
+            self._meshes_by_name[ref] = mesh_obj
+            return mesh_obj, ref
 
         obj = self._object_from_entry(ref)
         if obj is not None and hasattr(obj, "NbNodes"):
@@ -216,17 +218,38 @@ class SalomeRuntime:
                 name = obj.GetName() or ref
             except Exception:
                 pass
-            self._meshes_by_name[name] = obj
-            return obj, name
+            mesh_obj = self._coerce_mesh_wrapper(obj)
+            self._meshes_by_name[name] = mesh_obj
+            return mesh_obj, name
 
         entry = self._lookup_entry_by_name("SMESH", ref)
         if entry:
             obj = self._object_from_entry(entry)
             if obj is not None and hasattr(obj, "NbNodes"):
-                self._meshes_by_name[ref] = obj
-                return obj, ref
+                mesh_obj = self._coerce_mesh_wrapper(obj)
+                self._meshes_by_name[ref] = mesh_obj
+                return mesh_obj, ref
 
         raise RuntimeError(f"Mesh not found: {reference}")
+
+    def _coerce_mesh_wrapper(self, mesh_obj: Any) -> Any:
+        """Return a mesh object that supports high-level operations like Compute()."""
+        if hasattr(mesh_obj, "Compute"):
+            return mesh_obj
+
+        smesh_engine = self.exec_globals.get("smesh")
+        if smesh_engine is None:
+            return mesh_obj
+
+        try:
+            # SALOME 9.x: smesh is the builder instance and Mesh(obj) wraps a CORBA mesh proxy.
+            wrapped = smesh_engine.Mesh(mesh_obj)
+            if hasattr(wrapped, "Compute"):
+                return wrapped
+        except Exception:
+            pass
+
+        return mesh_obj
 
     @staticmethod
     def _normalized_format(filepath: str, requested: str = "auto") -> str:
@@ -1062,7 +1085,8 @@ class SalomeRuntime:
         detailed: Dict[str, int] = {}
         if smesh is not None and hasattr(smesh, "GetMeshInfo"):
             try:
-                raw = smesh.GetMeshInfo(mesh)
+                mesh_arg = mesh.GetMesh() if hasattr(mesh, "GetMesh") else mesh
+                raw = smesh.GetMeshInfo(mesh_arg)
                 for key, value in raw.items():
                     detailed[str(key)] = int(value)
             except Exception:
@@ -1074,6 +1098,10 @@ class SalomeRuntime:
     def compute_mesh(self, mesh_ref: str) -> Dict[str, Any]:
         self.initialize()
         mesh, mesh_name = self._resolve_mesh(mesh_ref)
+        if not hasattr(mesh, "Compute"):
+            raise RuntimeError(
+                "Resolved mesh object does not support Compute(). Recreate or reselect mesh."
+            )
         success = bool(mesh.Compute())
         self._refresh_gui()
 

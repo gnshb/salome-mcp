@@ -5,6 +5,7 @@ import socket
 import sys
 import threading
 import time
+import importlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -16,7 +17,7 @@ _ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(_ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(_ROOT_DIR))
 
-from salome_bridge import SalomeBridgeServer
+import salome_bridge
 
 DEFAULT_HOST = os.getenv("SALOME_MCP_BRIDGE_HOST", "localhost")
 DEFAULT_PORT = int(os.getenv("SALOME_MCP_BRIDGE_PORT", "1234"))
@@ -36,6 +37,7 @@ _STATE = BridgeState()
 _LOCK = threading.Lock()
 _STATUS_LABEL: Optional[QLabel] = None
 _STATUS_TIMER: Optional[QTimer] = None
+_QUIT_HOOK_INSTALLED = False
 
 
 def _desktop(context):
@@ -174,6 +176,82 @@ def _show_error(context, title: str, text: str) -> None:
     QMessageBox.critical(_desktop(context), title, text)
 
 
+def _stop_bridge_internal(show_info: bool, context=None) -> bool:
+    install_live_status_widget(context)
+
+    with _LOCK:
+        server = _STATE.server
+        thread = _STATE.thread
+        if server is None:
+            if show_info:
+                _show_info(context, "SALOME MCP Bridge", "Bridge is already stopped.")
+            return False
+
+        server.stop()
+
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=1.0)
+
+        _STATE.server = None
+        _STATE.thread = None
+
+    if show_info:
+        _show_info(context, "SALOME MCP Bridge", "Bridge stopped. Port is now closed.")
+    _refresh_status_widget()
+    return True
+
+
+def _on_app_about_to_quit() -> None:
+    try:
+        _stop_bridge_internal(show_info=False, context=None)
+    except Exception:
+        pass
+
+
+def install_quit_hook() -> None:
+    """Install one-time Qt aboutToQuit hook to ensure bridge port closes on exit."""
+    global _QUIT_HOOK_INSTALLED
+    if _QUIT_HOOK_INSTALLED:
+        return
+
+    app = None
+    try:
+        from qtsalome import QApplication  # type: ignore
+
+        app = QApplication.instance()
+    except Exception:
+        app = None
+
+    if app is None:
+        try:
+            from PyQt5.QtWidgets import QApplication  # type: ignore
+
+            app = QApplication.instance()
+        except Exception:
+            app = None
+
+    if app is None:
+        try:
+            from PyQt6.QtWidgets import QApplication  # type: ignore
+
+            app = QApplication.instance()
+        except Exception:
+            app = None
+
+    if app is None:
+        return
+
+    try:
+        app.aboutToQuit.connect(_on_app_about_to_quit)
+        _QUIT_HOOK_INSTALLED = True
+    except Exception:
+        pass
+
+
 def _start_bridge(
     context,
     host: str,
@@ -199,7 +277,13 @@ def _start_bridge(
             )
             return True
 
-        server = SalomeBridgeServer(host=host, port=port)
+        # Reload bridge module so Start picks up latest bridge code without SALOME restart.
+        try:
+            importlib.reload(salome_bridge)
+        except Exception:
+            pass
+
+        server = salome_bridge.SalomeBridgeServer(host=host, port=port)
         thread = threading.Thread(
             target=server.start,
             daemon=True,
@@ -329,23 +413,7 @@ def start_bridge_default(context) -> None:
 
 def stop_bridge(context) -> None:
     """Stop MCP bridge and close the listening port."""
-    install_live_status_widget(context)
-    with _LOCK:
-        if not _running():
-            _show_info(context, "SALOME MCP Bridge", "Bridge is already stopped.")
-            return
-
-        assert _STATE.server is not None
-        _STATE.server.stop()
-
-        if _STATE.thread is not None:
-            _STATE.thread.join(timeout=1.0)
-
-        _STATE.server = None
-        _STATE.thread = None
-
-    _show_info(context, "SALOME MCP Bridge", "Bridge stopped. Port is now closed.")
-    _refresh_status_widget()
+    _stop_bridge_internal(show_info=True, context=context)
 
 
 def bridge_status(context) -> None:
