@@ -95,3 +95,13 @@ claude mcp add salome uv run --directory /absolute/path/to/salome-mcp salome-mcp
 
 ## Note
 `execute_salome_code` executes arbitrary Python in the SALOME process. Keep bridge access local and trusted.
+
+## Sample 
+
+Prompt:
+
+```text
+lets do these step by step: 1. make a cylinder r = 4 h =8 and place it along x axis 2. make two more cylinders of r = 2 and h = 4 3. place these cylinders on either of the circular ends 4. carve a cylinder out of these smaller ones to make two shells of rout = 2 and rin = 1 5. fuse all 6. create the single vol group 7. make surface groups inlet outlet and walls 8. make a mesh with netgen 12 2d 3d very fine mesh. 9. compute mesh and report its stats
+```
+
+![image](./sample.png)
