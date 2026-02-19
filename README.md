@@ -1,6 +1,8 @@
 # SalomeMCP
 
-# Note: This is experimental! Use at your own risk!
+---
+### Note: This is experimental! Use at your own risk!
+---
 
 SALOME Model Context Protocol for agentinc use
 
