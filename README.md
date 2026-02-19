@@ -23,7 +23,7 @@ Runtime model:
 2. Python 3.10+
 3. `uv`
 
-# Setup
+## Setup
 
 ## First time
 ### 1) Install Python dependencies
@@ -67,7 +67,7 @@ cp salome_bridge.py ~/.config/salome/Plugins/
 claude mcp add salome uv run --directory /absolute/path/to/salome-mcp salome-mcp
 ```
 
-# Workflow
+## Workflow
 1. Start SALOME.
 2. In GUI: `MCP Bridge -> Start (default)`.
 3. Start/open your MCP agent client.
