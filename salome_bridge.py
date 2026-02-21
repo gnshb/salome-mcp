@@ -1001,6 +1001,89 @@ class SalomeRuntime:
             "subshape_ids": [int(i) for i in subshape_ids],
         }
 
+    def create_groups(
+        self,
+        shape_ref: str,
+        groups: Sequence[Dict[str, Any]],
+        replace_existing: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        salome = self.exec_globals.get("salome")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+        if salome is None:
+            raise RuntimeError("SALOME runtime is not available")
+
+        if not isinstance(groups, (list, tuple)) or not groups:
+            raise RuntimeError("groups must be a non-empty list")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        created: List[Dict[str, Any]] = []
+        removed: List[Dict[str, str]] = []
+
+        study = salome.myStudy
+        builder = study.NewBuilder()
+
+        for index, raw_group in enumerate(groups):
+            if not isinstance(raw_group, dict):
+                raise RuntimeError(f"groups[{index}] must be an object")
+
+            name = str(raw_group.get("name", f"Group_{index + 1}")).strip()
+            if not name:
+                raise RuntimeError(f"groups[{index}].name must not be empty")
+
+            shape_type_key = str(raw_group.get("subshape_type", "FACE")).upper().strip()
+            if shape_type_key not in geompy.ShapeType:
+                raise RuntimeError(
+                    f"groups[{index}].subshape_type '{shape_type_key}' is not supported"
+                )
+
+            raw_ids = raw_group.get("subshape_ids", [])
+            if raw_ids is None:
+                raw_ids = []
+            if not isinstance(raw_ids, (list, tuple)):
+                raise RuntimeError(f"groups[{index}].subshape_ids must be a list")
+            subshape_ids = [int(i) for i in raw_ids]
+
+            if replace_existing:
+                same_name = list(study.FindObjectByName(name, "GEOM"))
+                for sobj in same_name:
+                    entry = self._sobj_entry(sobj)
+                    if hasattr(builder, "RemoveObjectWithChildren"):
+                        builder.RemoveObjectWithChildren(sobj)
+                    else:
+                        builder.RemoveObject(sobj)
+                    removed.append({"name": name, "entry": entry})
+
+            group = geompy.CreateGroup(shape, geompy.ShapeType[shape_type_key])
+            if subshape_ids:
+                geompy.UnionIDs(group, subshape_ids)
+
+            if hasattr(geompy, "addToStudyInFather"):
+                entry = geompy.addToStudyInFather(shape, group, name)
+            else:
+                entry = geompy.addToStudy(group, name)
+
+            created.append(
+                {
+                    "name": name,
+                    "entry": entry,
+                    "subshape_type": shape_type_key,
+                    "subshape_count": len(subshape_ids),
+                    "subshape_ids": subshape_ids,
+                }
+            )
+
+        self._refresh_gui()
+        return {
+            "message": f"Created {len(created)} group(s)",
+            "shape": shape_ref,
+            "replace_existing": bool(replace_existing),
+            "removed": removed,
+            "groups": created,
+        }
+
     def create_surface_group(
         self,
         shape_ref: str,
@@ -1317,6 +1400,207 @@ class SalomeRuntime:
             "volume_algorithm": vol_algo_name,
         }
 
+    def create_mesh_with_hypotheses(
+        self,
+        shape_ref: str,
+        mesh_name: str,
+        algorithm: str,
+        hypotheses: Optional[Dict[str, Any]],
+        compute: bool,
+    ) -> Dict[str, Any]:
+        self.initialize()
+        smesh = self.exec_globals.get("smesh")
+        smesh_builder = self.exec_globals.get("smeshBuilder")
+        if smesh is None or smesh_builder is None:
+            raise RuntimeError("SMESH is not available in this SALOME session")
+
+        shape, _, _ = self._resolve_shape(shape_ref)
+        mesh = smesh.Mesh(shape, mesh_name)
+
+        algo_key = str(algorithm).lower().strip().replace("-", "_").replace(" ", "_")
+
+        netgen_algorithms = {
+            "netgen_1d2d3d": ("Tetrahedron", "NETGEN_1D2D3D"),
+            "netgen_2d3d": ("Tetrahedron", "NETGEN_2D3D"),
+            "netgen_1d2d": ("Triangle", "NETGEN_1D2D"),
+            "netgen_2d": ("Triangle", "NETGEN_2D"),
+        }
+        aliases = {
+            "netgen": "netgen_1d2d3d",
+            "tetra": "tetrahedron",
+            "hexa": "hexahedron",
+            "quad": "quadrangle",
+        }
+        algo_key = aliases.get(algo_key, algo_key)
+
+        if algo_key in netgen_algorithms:
+            method_name, builder_const = netgen_algorithms[algo_key]
+            algo_factory = getattr(mesh, method_name, None)
+            builder_algo = getattr(smesh_builder, builder_const, None)
+            if algo_factory is None or builder_algo is None:
+                raise RuntimeError(
+                    f"Algorithm '{algorithm}' is not available in this SALOME build"
+                )
+            algo = algo_factory(algo=builder_algo)
+        elif algo_key == "tetrahedron":
+            algo = mesh.Tetrahedron()
+        elif algo_key == "hexahedron":
+            algo = mesh.Hexahedron()
+        elif algo_key == "triangle":
+            algo = mesh.Triangle()
+        elif algo_key == "quadrangle":
+            algo = mesh.Quadrangle()
+        else:
+            raise RuntimeError(
+                "Unsupported algorithm. Use one of: "
+                "netgen_1d2d3d, netgen_2d3d, netgen_1d2d, netgen_2d, "
+                "tetrahedron, hexahedron, triangle, quadrangle"
+            )
+
+        hyp = hypotheses or {}
+        if not isinstance(hyp, dict):
+            raise RuntimeError("hypotheses must be an object (dictionary)")
+
+        applied: Dict[str, Any] = {}
+        ignored: Dict[str, str] = {}
+
+        if "segment_count" in hyp and hyp.get("segment_count") is not None:
+            seg_count = int(hyp["segment_count"])
+            if seg_count > 0:
+                seg_algo = mesh.Segment()
+                seg_algo.NumberOfSegments(seg_count)
+                applied["segment_count"] = seg_count
+            else:
+                raise RuntimeError("hypotheses.segment_count must be > 0 when provided")
+
+        if "max_element_area" in hyp and hyp.get("max_element_area") is not None:
+            if hasattr(algo, "MaxElementArea"):
+                value = float(hyp["max_element_area"])
+                algo.MaxElementArea(value)
+                applied["max_element_area"] = value
+            else:
+                ignored["max_element_area"] = "Algorithm does not support MaxElementArea"
+
+        if "max_element_volume" in hyp and hyp.get("max_element_volume") is not None:
+            if hasattr(algo, "MaxElementVolume"):
+                value = float(hyp["max_element_volume"])
+                algo.MaxElementVolume(value)
+                applied["max_element_volume"] = value
+            else:
+                ignored["max_element_volume"] = "Algorithm does not support MaxElementVolume"
+
+        params = None
+        if hasattr(algo, "Parameters"):
+            try:
+                params = algo.Parameters()
+            except Exception:
+                params = None
+
+        if "fineness" in hyp and hyp.get("fineness") is not None:
+            if params is None or not hasattr(params, "SetFineness"):
+                ignored["fineness"] = "Algorithm does not expose NETGEN parameters"
+            else:
+                fineness_name = str(hyp["fineness"]).lower().strip().replace("-", "_")
+                fineness_aliases = {
+                    "very_coarse": "VeryCoarse",
+                    "coarse": "Coarse",
+                    "moderate": "Moderate",
+                    "medium": "Moderate",
+                    "fine": "Fine",
+                    "very_fine": "VeryFine",
+                    "user_defined": "UserDefined",
+                    "custom": "UserDefined",
+                }
+                const_name = fineness_aliases.get(fineness_name)
+                if not const_name:
+                    raise RuntimeError(
+                        "Unsupported fineness value. Use one of: very_coarse, coarse, "
+                        "moderate, fine, very_fine, user_defined"
+                    )
+                const_value = getattr(smesh_builder, const_name, None)
+                if const_value is None:
+                    raise RuntimeError(f"SMESH fineness constant '{const_name}' is unavailable")
+                params.SetFineness(const_value)
+                applied["fineness"] = fineness_name
+
+        netgen_number_settings = {
+            "max_size": ("SetMaxSize", float),
+            "min_size": ("SetMinSize", float),
+            "growth_rate": ("SetGrowthRate", float),
+            "nb_seg_per_edge": ("SetNbSegPerEdge", int),
+            "nb_seg_per_radius": ("SetNbSegPerRadius", int),
+            "chordal_error": ("SetChordalError", float),
+        }
+        netgen_flag_settings = {
+            "second_order": "SetSecondOrder",
+            "optimize": "SetOptimize",
+            "use_surface_curvature": "SetUseSurfaceCurvature",
+            "fuse_edges": "SetFuseEdges",
+            "quad_allowed": "SetQuadAllowed",
+            "chordal_error_enabled": "SetChordalErrorEnabled",
+        }
+
+        for key, (method_name, caster) in netgen_number_settings.items():
+            if key not in hyp or hyp.get(key) is None:
+                continue
+            if params is None or not hasattr(params, method_name):
+                ignored[key] = "Algorithm does not expose NETGEN parameter method"
+                continue
+            value = caster(hyp[key])
+            getattr(params, method_name)(value)
+            applied[key] = value
+
+        for key, method_name in netgen_flag_settings.items():
+            if key not in hyp or hyp.get(key) is None:
+                continue
+            if params is None or not hasattr(params, method_name):
+                ignored[key] = "Algorithm does not expose NETGEN parameter method"
+                continue
+            value = 1 if bool(hyp[key]) else 0
+            getattr(params, method_name)(value)
+            applied[key] = bool(hyp[key])
+
+        known_hyp_keys = {
+            "segment_count",
+            "max_element_area",
+            "max_element_volume",
+            "fineness",
+            "max_size",
+            "min_size",
+            "growth_rate",
+            "nb_seg_per_edge",
+            "nb_seg_per_radius",
+            "chordal_error",
+            "second_order",
+            "optimize",
+            "use_surface_curvature",
+            "fuse_edges",
+            "quad_allowed",
+            "chordal_error_enabled",
+        }
+        unknown_hypotheses = sorted([str(k) for k in hyp.keys() if k not in known_hyp_keys])
+
+        registered = self._register_mesh(mesh, mesh_name)
+        compute_success = None
+        mesh_info = None
+        if compute:
+            compute_success = bool(mesh.Compute())
+            mesh_info = self.get_mesh_info(registered)
+
+        self._refresh_gui()
+        return {
+            "message": f"Created mesh definition '{registered}'",
+            "mesh_name": registered,
+            "shape": shape_ref,
+            "algorithm": algo_key,
+            "hypotheses_applied": applied,
+            "hypotheses_ignored": ignored,
+            "unknown_hypotheses": unknown_hypotheses,
+            "computed": bool(compute),
+            "compute_success": compute_success,
+            "mesh": mesh_info,
+        }
+
     def get_mesh_info(self, mesh_ref: str) -> Dict[str, Any]:
         self.initialize()
         smesh = self.exec_globals.get("smesh")
@@ -1603,6 +1887,11 @@ class SalomeBridgeServer:
                 [int(x) for x in p.get("subshape_ids", [])],
                 str(p.get("name", "Group")),
             ),
+            "create_groups": lambda p: self.runtime.create_groups(
+                str(p["shape_ref"]),
+                p.get("groups", []),
+                bool(p.get("replace_existing", False)),
+            ),
             "create_surface_group": lambda p: self.runtime.create_surface_group(
                 str(p["shape_ref"]),
                 [int(x) for x in p.get("subshape_ids", [])],
@@ -1662,6 +1951,13 @@ class SalomeBridgeServer:
                 else float(p.get("max_element_volume")),
                 str(p.get("surface_algorithm", "triangle")),
                 str(p.get("volume_algorithm", "tetrahedron")),
+            ),
+            "create_mesh_with_hypotheses": lambda p: self.runtime.create_mesh_with_hypotheses(
+                str(p["shape_ref"]),
+                str(p.get("mesh_name", "Mesh")),
+                str(p.get("algorithm", "netgen_1d2d3d")),
+                p.get("hypotheses"),
+                bool(p.get("compute", False)),
             ),
             "compute_mesh": lambda p: self.runtime.compute_mesh(str(p["mesh_ref"])),
             "get_mesh_info": lambda p: self.runtime.get_mesh_info(str(p["mesh_ref"])),

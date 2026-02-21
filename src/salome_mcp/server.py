@@ -470,6 +470,29 @@ def create_group(
 
 
 @mcp.tool()
+def create_groups(
+    ctx: Context,
+    shape_ref: str,
+    groups: List[Dict[str, Any]],
+    replace_existing: bool = False,
+) -> str:
+    """
+    Create multiple GEOM groups in one call.
+
+    Each group item supports: name, subshape_type, subshape_ids.
+    """
+    _ = ctx
+    return _run(
+        "create_groups",
+        {
+            "shape_ref": shape_ref,
+            "groups": groups,
+            "replace_existing": replace_existing,
+        },
+    )
+
+
+@mcp.tool()
 def create_surface_group(
     ctx: Context,
     shape_ref: str,
@@ -655,6 +678,43 @@ def create_mesh(
             "max_element_volume": max_element_volume,
             "surface_algorithm": surface_algorithm,
             "volume_algorithm": volume_algorithm,
+        },
+    )
+
+
+@mcp.tool()
+def create_mesh_with_hypotheses(
+    ctx: Context,
+    shape_ref: str,
+    algorithm: str = "netgen_1d2d3d",
+    hypotheses: Optional[Dict[str, Any]] = None,
+    mesh_name: str = "Mesh",
+    compute: bool = False,
+) -> str:
+    """
+    Create mesh with explicit algorithm and detailed hypotheses.
+
+    Supported algorithm values:
+    - netgen_1d2d3d | netgen_2d3d | netgen_1d2d | netgen_2d
+    - tetrahedron | hexahedron | triangle | quadrangle
+
+    Common hypotheses keys:
+    - segment_count
+    - fineness (very_coarse/coarse/moderate/fine/very_fine/user_defined)
+    - max_size, min_size, growth_rate
+    - nb_seg_per_edge, nb_seg_per_radius
+    - second_order, optimize, use_surface_curvature, fuse_edges, quad_allowed
+    - max_element_area, max_element_volume
+    """
+    _ = ctx
+    return _run(
+        "create_mesh_with_hypotheses",
+        {
+            "shape_ref": shape_ref,
+            "algorithm": algorithm,
+            "hypotheses": hypotheses or {},
+            "mesh_name": mesh_name,
+            "compute": compute,
         },
     )
 
