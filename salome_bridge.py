@@ -87,6 +87,38 @@ class SalomeRuntime:
         except Exception:
             pass
 
+    def _apply_visibility(
+        self,
+        show_entries: Optional[Sequence[str]] = None,
+        hide_entries: Optional[Sequence[str]] = None,
+    ) -> None:
+        salome = self.exec_globals.get("salome")
+        if not salome:
+            return
+        try:
+            if not salome.sg.hasDesktop():
+                return
+        except Exception:
+            return
+
+        show = {entry for entry in (show_entries or []) if entry}
+        hide = {entry for entry in (hide_entries or []) if entry}
+        hide -= show
+
+        for entry in hide:
+            try:
+                salome.sg.Erase(entry)
+            except Exception:
+                pass
+
+        for entry in show:
+            try:
+                salome.sg.Display(entry)
+            except Exception:
+                pass
+
+        self._refresh_gui()
+
     def _iter_component_sobjects(self, component: str, include_nested: bool = True) -> List[Any]:
         self.initialize()
         salome = self.exec_globals["salome"]
@@ -343,7 +375,7 @@ class SalomeRuntime:
 
         shape = geompy.MakeBoxDXDYDZ(dx, dy, dz)
         entry = geompy.addToStudy(shape, name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry])
         return {
             "message": f"Created box '{name}'",
             "entry": entry,
@@ -358,7 +390,7 @@ class SalomeRuntime:
 
         shape = geompy.MakeCylinderRH(radius, height)
         entry = geompy.addToStudy(shape, name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry])
         return {
             "message": f"Created cylinder '{name}'",
             "entry": entry,
@@ -373,7 +405,7 @@ class SalomeRuntime:
 
         shape = geompy.MakeSphereR(radius)
         entry = geompy.addToStudy(shape, name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry])
         return {
             "message": f"Created sphere '{name}'",
             "entry": entry,
@@ -410,14 +442,14 @@ class SalomeRuntime:
         if geompy is None:
             raise RuntimeError("GEOM is not available in this SALOME session")
 
-        shape, _, _ = self._resolve_shape(source_ref)
+        shape, source_entry, _ = self._resolve_shape(source_ref)
         try:
             copied = geompy.MakeCopy(shape)
         except Exception:
             copied = geompy.MakeTranslation(shape, 0.0, 0.0, 0.0)
 
         entry = geompy.addToStudy(copied, name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry], hide_entries=[source_entry])
         return {
             "message": f"Created copy '{name}'",
             "entry": entry,
@@ -437,7 +469,7 @@ class SalomeRuntime:
         if count < 1:
             raise RuntimeError("count must be >= 1")
 
-        shape, _, source_name = self._resolve_shape(source_ref)
+        shape, source_entry, source_name = self._resolve_shape(source_ref)
         prefix = (name_prefix or f"{source_name}_copy").strip()
         if not prefix:
             prefix = "Copy"
@@ -452,7 +484,10 @@ class SalomeRuntime:
             entry = geompy.addToStudy(copied, copy_name)
             items.append({"name": copy_name, "entry": entry})
 
-        self._refresh_gui()
+        self._apply_visibility(
+            show_entries=[str(item["entry"]) for item in items],
+            hide_entries=[source_entry],
+        )
         return {
             "message": f"Created {count} duplicate(s) from '{source_ref}'",
             "source": source_ref,
@@ -466,27 +501,69 @@ class SalomeRuntime:
         dx: float,
         dy: float,
         dz: float,
-        result_name: str,
     ) -> Dict[str, Any]:
         self.initialize()
         geompy = self.exec_globals.get("geompy")
         if geompy is None:
             raise RuntimeError("GEOM is not available in this SALOME session")
 
-        shape, _, _ = self._resolve_shape(source_ref)
-        try:
-            translated = geompy.MakeTranslation(shape, float(dx), float(dy), float(dz))
-        except TypeError:
-            vector = geompy.MakeVectorDXDYDZ(float(dx), float(dy), float(dz))
-            translated = geompy.MakeTranslationVector(shape, vector)
+        dx_val = float(dx)
+        dy_val = float(dy)
+        dz_val = float(dz)
+        shape, source_entry, source_name = self._resolve_shape(source_ref)
 
-        entry = geompy.addToStudy(translated, result_name)
-        self._refresh_gui()
+        translated_in_place = False
+        errors: List[str] = []
+
+        if hasattr(geompy, "TranslateDXDYDZ"):
+            try:
+                geompy.TranslateDXDYDZ(shape, dx_val, dy_val, dz_val, theCopy=False)
+                translated_in_place = True
+            except TypeError:
+                try:
+                    geompy.TranslateDXDYDZ(shape, dx_val, dy_val, dz_val, False)
+                    translated_in_place = True
+                except TypeError:
+                    try:
+                        geompy.TranslateDXDYDZ(shape, dx_val, dy_val, dz_val)
+                        translated_in_place = True
+                    except Exception as exc:
+                        errors.append(f"TranslateDXDYDZ failed: {exc}")
+                except Exception as exc:
+                    errors.append(f"TranslateDXDYDZ failed: {exc}")
+            except Exception as exc:
+                errors.append(f"TranslateDXDYDZ failed: {exc}")
+
+        if not translated_in_place and hasattr(geompy, "TranslateVector"):
+            vector = geompy.MakeVectorDXDYDZ(dx_val, dy_val, dz_val)
+            try:
+                geompy.TranslateVector(shape, vector, theCopy=False)
+                translated_in_place = True
+            except TypeError:
+                try:
+                    geompy.TranslateVector(shape, vector, False)
+                    translated_in_place = True
+                except TypeError:
+                    try:
+                        geompy.TranslateVector(shape, vector)
+                        translated_in_place = True
+                    except Exception as exc:
+                        errors.append(f"TranslateVector failed: {exc}")
+                except Exception as exc:
+                    errors.append(f"TranslateVector failed: {exc}")
+            except Exception as exc:
+                errors.append(f"TranslateVector failed: {exc}")
+
+        if not translated_in_place:
+            detail = "; ".join(errors) if errors else "No supported in-place translation API found."
+            raise RuntimeError(f"Failed to translate object in place. {detail}")
+
+        self._apply_visibility(show_entries=[source_entry])
         return {
-            "message": f"Created translation '{result_name}'",
-            "entry": entry,
+            "message": f"Translated '{source_name}' in place",
+            "entry": source_entry,
             "source": source_ref,
-            "offset": {"dx": float(dx), "dy": float(dy), "dz": float(dz)},
+            "offset": {"dx": dx_val, "dy": dy_val, "dz": dz_val},
         }
 
     def rotate_object(
@@ -494,7 +571,6 @@ class SalomeRuntime:
         source_ref: str,
         angle_degrees: float,
         axis: str,
-        result_name: str,
     ) -> Dict[str, Any]:
         self.initialize()
         geompy = self.exec_globals.get("geompy")
@@ -510,16 +586,39 @@ class SalomeRuntime:
         if axis_key not in axis_map:
             raise RuntimeError("axis must be one of: X, Y, Z")
 
-        shape, _, _ = self._resolve_shape(source_ref)
+        shape, source_entry, source_name = self._resolve_shape(source_ref)
         axis_vec = geompy.MakeVectorDXDYDZ(*axis_map[axis_key])
         angle_radians = math.radians(float(angle_degrees))
-        rotated = geompy.MakeRotation(shape, axis_vec, angle_radians)
 
-        entry = geompy.addToStudy(rotated, result_name)
-        self._refresh_gui()
+        rotated_in_place = False
+        errors: List[str] = []
+        if hasattr(geompy, "Rotate"):
+            try:
+                geompy.Rotate(shape, axis_vec, angle_radians, theCopy=False)
+                rotated_in_place = True
+            except TypeError:
+                try:
+                    geompy.Rotate(shape, axis_vec, angle_radians, False)
+                    rotated_in_place = True
+                except TypeError:
+                    try:
+                        geompy.Rotate(shape, axis_vec, angle_radians)
+                        rotated_in_place = True
+                    except Exception as exc:
+                        errors.append(f"Rotate failed: {exc}")
+                except Exception as exc:
+                    errors.append(f"Rotate failed: {exc}")
+            except Exception as exc:
+                errors.append(f"Rotate failed: {exc}")
+
+        if not rotated_in_place:
+            detail = "; ".join(errors) if errors else "No supported in-place rotation API found."
+            raise RuntimeError(f"Failed to rotate object in place. {detail}")
+
+        self._apply_visibility(show_entries=[source_entry])
         return {
-            "message": f"Created rotation '{result_name}'",
-            "entry": entry,
+            "message": f"Rotated '{source_name}' in place",
+            "entry": source_entry,
             "source": source_ref,
             "axis": axis_key,
             "angle_degrees": float(angle_degrees),
@@ -658,8 +757,10 @@ class SalomeRuntime:
         if geompy is None:
             raise RuntimeError("GEOM is not available in this SALOME session")
 
-        base_shape, _, _ = self._resolve_shape(base_object)
-        tool_shapes = [self._resolve_shape(ref)[0] for ref in tool_objects]
+        base_shape, base_entry, _ = self._resolve_shape(base_object)
+        resolved_tools = [self._resolve_shape(ref) for ref in tool_objects]
+        tool_shapes = [item[0] for item in resolved_tools]
+        tool_entries = [item[1] for item in resolved_tools]
         op = operation.lower().strip()
 
         if not tool_shapes:
@@ -675,7 +776,10 @@ class SalomeRuntime:
             raise RuntimeError(f"Unsupported boolean operation: {operation}")
 
         entry = geompy.addToStudy(result, result_name)
-        self._refresh_gui()
+        self._apply_visibility(
+            show_entries=[entry],
+            hide_entries=[base_entry] + tool_entries,
+        )
         return {
             "message": f"Created boolean {op} '{result_name}'",
             "entry": entry,
@@ -781,8 +885,11 @@ class SalomeRuntime:
         if geompy is None:
             raise RuntimeError("GEOM is not available in this SALOME session")
 
-        objects = [self._resolve_shape(ref)[0] for ref in object_refs]
-        tools = [self._resolve_shape(ref)[0] for ref in tool_refs]
+        resolved_objects = [self._resolve_shape(ref) for ref in object_refs]
+        resolved_tools = [self._resolve_shape(ref) for ref in tool_refs]
+        objects = [item[0] for item in resolved_objects]
+        tools = [item[0] for item in resolved_tools]
+        hidden_entries = [item[1] for item in resolved_objects + resolved_tools]
         if not objects:
             raise RuntimeError("At least one object is required for partition")
 
@@ -804,7 +911,7 @@ class SalomeRuntime:
             result = geompy.MakePartition(objects, tools)
 
         entry = geompy.addToStudy(result, result_name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry], hide_entries=hidden_entries)
         return {
             "message": f"Created partition '{result_name}'",
             "entry": entry,
@@ -890,7 +997,7 @@ class SalomeRuntime:
 
         obj_name = name or f"Imported_{Path(filepath).stem}"
         entry = geompy.addToStudy(shape, obj_name)
-        self._refresh_gui()
+        self._apply_visibility(show_entries=[entry])
         return {
             "message": f"Imported geometry '{obj_name}'",
             "entry": entry,
@@ -1247,6 +1354,29 @@ class SalomeBridgeServer:
         command_type = command.get("type")
         params = command.get("params", {})
 
+        def _translate_handler(p: Dict[str, Any]) -> Dict[str, Any]:
+            if "result_name" in p:
+                raise RuntimeError(
+                    "translate_object no longer accepts 'result_name'; transforms are now in place."
+                )
+            return self.runtime.translate_object(
+                str(p["source_ref"]),
+                float(p.get("dx", 0.0)),
+                float(p.get("dy", 0.0)),
+                float(p.get("dz", 0.0)),
+            )
+
+        def _rotate_handler(p: Dict[str, Any]) -> Dict[str, Any]:
+            if "result_name" in p:
+                raise RuntimeError(
+                    "rotate_object no longer accepts 'result_name'; transforms are now in place."
+                )
+            return self.runtime.rotate_object(
+                str(p["source_ref"]),
+                float(p["angle_degrees"]),
+                str(p.get("axis", "Z")),
+            )
+
         handlers = {
             "ping": lambda _params: self.runtime.ping(),
             "get_study_info": lambda _params: self.runtime.get_study_info(),
@@ -1295,19 +1425,8 @@ class SalomeBridgeServer:
                 int(p.get("count", 1)),
                 p.get("name_prefix"),
             ),
-            "translate_object": lambda p: self.runtime.translate_object(
-                str(p["source_ref"]),
-                float(p.get("dx", 0.0)),
-                float(p.get("dy", 0.0)),
-                float(p.get("dz", 0.0)),
-                str(p.get("result_name", "Translated")),
-            ),
-            "rotate_object": lambda p: self.runtime.rotate_object(
-                str(p["source_ref"]),
-                float(p["angle_degrees"]),
-                str(p.get("axis", "Z")),
-                str(p.get("result_name", "Rotated")),
-            ),
+            "translate_object": _translate_handler,
+            "rotate_object": _rotate_handler,
             "rename_object": lambda p: self.runtime.rename_object(
                 str(p["object_ref"]),
                 str(p["new_name"]),
@@ -1398,6 +1517,10 @@ class SalomeBridgeServer:
 
         handler = handlers.get(command_type)
         if handler is None:
+            try:
+                self.runtime._refresh_gui()
+            except Exception:
+                pass
             return {
                 "status": "error",
                 "message": f"Unknown command type: {command_type}",
@@ -1410,6 +1533,11 @@ class SalomeBridgeServer:
             logger.error("Command '%s' failed: %s", command_type, exc)
             logger.debug("%s", traceback.format_exc())
             return {"status": "error", "message": str(exc)}
+        finally:
+            try:
+                self.runtime._refresh_gui()
+            except Exception:
+                pass
 
 
 def main() -> None:

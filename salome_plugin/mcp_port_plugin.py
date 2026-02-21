@@ -1,5 +1,7 @@
 """SALOME GUI plugin helpers to manage MCP bridge ports."""
 
+from __future__ import annotations
+
 import os
 import socket
 import sys
@@ -29,7 +31,7 @@ STATUS_POLL_INTERVAL_MS = int(os.getenv("SALOME_MCP_STATUS_POLL_MS", "3000"))
 class BridgeState:
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
-    server: Optional[SalomeBridgeServer] = None
+    server: Optional[salome_bridge.SalomeBridgeServer] = None
     thread: Optional[threading.Thread] = None
 
 

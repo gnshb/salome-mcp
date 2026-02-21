@@ -357,9 +357,8 @@ def translate_object(
     dx: float,
     dy: float,
     dz: float,
-    result_name: str = "Translated",
 ) -> str:
-    """Create translated GEOM copy by vector components."""
+    """Translate a GEOM object in place by vector components (no new copy)."""
     _ = ctx
     return _run(
         "translate_object",
@@ -368,7 +367,6 @@ def translate_object(
             "dx": dx,
             "dy": dy,
             "dz": dz,
-            "result_name": result_name,
         },
     )
 
@@ -379,9 +377,8 @@ def rotate_object(
     source_ref: str,
     angle_degrees: float,
     axis: str = "Z",
-    result_name: str = "Rotated",
 ) -> str:
-    """Create rotated GEOM copy around X/Y/Z axis (degrees)."""
+    """Rotate a GEOM object in place around X/Y/Z axis (degrees, no new copy)."""
     _ = ctx
     return _run(
         "rotate_object",
@@ -389,7 +386,6 @@ def rotate_object(
             "source_ref": source_ref,
             "angle_degrees": angle_degrees,
             "axis": axis,
-            "result_name": result_name,
         },
     )
 
