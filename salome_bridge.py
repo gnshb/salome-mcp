@@ -412,6 +412,151 @@ class SalomeRuntime:
             "parameters": {"radius": radius},
         }
 
+    def create_naca4_airfoil(
+        self,
+        code: str,
+        chord: float,
+        n_points: int,
+        closed_te: bool,
+        span: float,
+        name: Optional[str],
+    ) -> Dict[str, Any]:
+        self.initialize()
+        geompy = self.exec_globals.get("geompy")
+        if geompy is None:
+            raise RuntimeError("GEOM is not available in this SALOME session")
+
+        naca = str(code).strip()
+        if len(naca) != 4 or not naca.isdigit():
+            raise RuntimeError("NACA code must be a 4-digit string (for example: '2412').")
+
+        chord_value = float(chord)
+        if chord_value <= 0.0:
+            raise RuntimeError("chord must be > 0")
+
+        sample_count = int(n_points)
+        if sample_count < 5:
+            raise RuntimeError("n_points must be >= 5")
+        span_value = float(span)
+        if span_value < 0.0:
+            raise RuntimeError("span must be >= 0")
+
+        m = int(naca[0]) / 100.0
+        p = int(naca[1]) / 10.0
+        t = int(naca[2:]) / 100.0
+        if m > 0.0 and (p <= 0.0 or p >= 1.0):
+            raise RuntimeError("Invalid camber location in NACA code; second digit must be 1..9 for cambered airfoils.")
+
+        trailing_coeff = -0.1036 if bool(closed_te) else -0.1015
+
+        x_values: List[float] = []
+        for idx in range(sample_count):
+            beta = math.pi * idx / (sample_count - 1)
+            x_values.append(0.5 * (1.0 - math.cos(beta)))
+
+        upper: List[Tuple[float, float, float]] = []
+        lower: List[Tuple[float, float, float]] = []
+        for x in x_values:
+            yt = 5.0 * t * (
+                0.2969 * math.sqrt(max(0.0, x))
+                - 0.1260 * x
+                - 0.3516 * x * x
+                + 0.2843 * x * x * x
+                + trailing_coeff * x * x * x * x
+            )
+
+            if m <= 0.0:
+                yc = 0.0
+                dyc_dx = 0.0
+            elif x < p:
+                yc = (m / (p * p)) * (2.0 * p * x - x * x)
+                dyc_dx = (2.0 * m / (p * p)) * (p - x)
+            else:
+                one_minus_p = 1.0 - p
+                yc = (m / (one_minus_p * one_minus_p)) * ((1.0 - 2.0 * p) + 2.0 * p * x - x * x)
+                dyc_dx = (2.0 * m / (one_minus_p * one_minus_p)) * (p - x)
+
+            theta = math.atan(dyc_dx)
+            xu = (x - yt * math.sin(theta)) * chord_value
+            yu = (yc + yt * math.cos(theta)) * chord_value
+            xl = (x + yt * math.sin(theta)) * chord_value
+            yl = (yc - yt * math.cos(theta)) * chord_value
+
+            upper.append((xu, yu, 0.0))
+            lower.append((xl, yl, 0.0))
+
+        perimeter = list(reversed(upper)) + lower[1:]
+        vertices = [geompy.MakeVertex(px, py, pz) for px, py, pz in perimeter]
+
+        edges: List[Any] = []
+        for idx in range(len(vertices) - 1):
+            v1 = vertices[idx]
+            v2 = vertices[idx + 1]
+            try:
+                edge = geompy.MakeLineTwoPnt(v1, v2)
+            except Exception:
+                edge = geompy.MakeEdge(v1, v2)
+            edges.append(edge)
+
+        first = perimeter[0]
+        last = perimeter[-1]
+        gap = math.sqrt((last[0] - first[0]) ** 2 + (last[1] - first[1]) ** 2 + (last[2] - first[2]) ** 2)
+        if gap > max(1e-9, abs(chord_value) * 1e-9):
+            try:
+                closing_edge = geompy.MakeLineTwoPnt(vertices[-1], vertices[0])
+            except Exception:
+                closing_edge = geompy.MakeEdge(vertices[-1], vertices[0])
+            edges.append(closing_edge)
+
+        try:
+            wire = geompy.MakeWire(edges, 1e-7)
+        except TypeError:
+            wire = geompy.MakeWire(edges)
+
+        shape = wire
+        shape_kind = "WIRE"
+        try:
+            shape = geompy.MakeFace(wire, True)
+            shape_kind = "FACE"
+        except TypeError:
+            try:
+                shape = geompy.MakeFace(wire, 1)
+                shape_kind = "FACE"
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if span_value > 0.0:
+            if shape_kind != "FACE":
+                try:
+                    shape = geompy.MakeFace(wire, True)
+                    shape_kind = "FACE"
+                except Exception:
+                    raise RuntimeError("Could not build a face from the airfoil wire; cannot create 3D solid.")
+            shape = geompy.MakePrismDXDYDZ(shape, 0.0, 0.0, span_value)
+            shape_kind = "SOLID"
+
+        shape_name = (name or f"NACA{naca}").strip() or f"NACA{naca}"
+        entry = geompy.addToStudy(shape, shape_name)
+        self._apply_visibility(show_entries=[entry])
+        return {
+            "message": f"Created NACA {naca} airfoil '{shape_name}'",
+            "entry": entry,
+            "shape_type": shape_kind,
+            "code": naca,
+            "parameters": {
+                "chord": chord_value,
+                "n_points": sample_count,
+                "closed_te": bool(closed_te),
+                "span": span_value,
+                "m": m,
+                "p": p,
+                "t": t,
+            },
+            "point_count": len(perimeter),
+        }
+
     def fuse_objects(
         self,
         base_object: str,
@@ -1394,6 +1539,14 @@ class SalomeBridgeServer:
             ),
             "create_sphere": lambda p: self.runtime.create_sphere(
                 float(p["radius"]), str(p.get("name", "Sphere"))
+            ),
+            "create_naca4_airfoil": lambda p: self.runtime.create_naca4_airfoil(
+                str(p["code"]),
+                float(p.get("chord", 1.0)),
+                int(p.get("n_points", 121)),
+                bool(p.get("closed_te", True)),
+                float(p.get("span", 0.01)),
+                p.get("name"),
             ),
             "boolean_operation": lambda p: self.runtime.boolean_operation(
                 str(p["operation"]),

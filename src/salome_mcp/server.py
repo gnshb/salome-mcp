@@ -242,6 +242,31 @@ def create_sphere(ctx: Context, radius: float, name: str = "Sphere") -> str:
 
 
 @mcp.tool()
+def create_naca4_airfoil(
+    ctx: Context,
+    code: str,
+    chord: float = 1.0,
+    n_points: int = 121,
+    closed_te: bool = True,
+    span: float = 0.01,
+    name: Optional[str] = None,
+) -> str:
+    """Create a NACA 4-digit airfoil (3D solid if span>0, 2D profile if span=0)."""
+    _ = ctx
+    return _run(
+        "create_naca4_airfoil",
+        {
+            "code": code,
+            "chord": chord,
+            "n_points": n_points,
+            "closed_te": closed_te,
+            "span": span,
+            "name": name,
+        },
+    )
+
+
+@mcp.tool()
 def boolean_operation(
     ctx: Context,
     operation: str,
