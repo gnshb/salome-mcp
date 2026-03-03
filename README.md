@@ -50,11 +50,10 @@ codex mcp add salome -- uv run --directory /path/to/salome-mcp salome-mcp
 By default, the bridge uses `localhost:1234`. You can set your custom host/port in the SALOME GUI bridge settings, then simply prompt your agent to connect to that.
 
 ## Usage
-1. Start SALOME
-2. In GUI: `Tools -> PLugins -> MCP Bridge -> Start (default)`
-3. Open your agent and prompt to ping salome. The agent should use `check_salome_status` and return success
-4. The agent should now be able to make tool calls based on your prompts. Check [samples](#samples)
-5. End session with `MCP Bridge -> Stop`
+1. Start SALOME and start: `Tools -> PLugins -> MCP Bridge -> Start (default)`
+2. Open your agent and prompt it to "ping salome". The agent should be able to use `check_salome_status` and return success
+3. The agent should now be able to make tool calls based on your prompts. Check [samples](#samples)
+4. End session with `MCP Bridge -> Stop`
 
 ## Tool Coverage
 These are the tool calls that can be used by your agent. You probably don't need to know this
