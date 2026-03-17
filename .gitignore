@@ -5,3 +5,14 @@ __pycache__/
 
 # Local virtual environment
 .venv/
+
+# Project-local agent config
+.codex/
+.claude/
+.aider*
+.cline/
+.continue/
+.cursor/
+.gemini/
+.roo/
+.windsurf/

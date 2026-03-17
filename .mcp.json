@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "salome": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "./",
+        "salome-mcp"
+      ],
+      "env": {}
+    }
+  }
+}
