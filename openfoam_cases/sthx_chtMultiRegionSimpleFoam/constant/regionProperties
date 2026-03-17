@@ -1,0 +1,13 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      regionProperties;
+}
+
+regions
+(
+    fluid   (shell_side_fluid tube_side_fluid)
+    solid   ()
+);

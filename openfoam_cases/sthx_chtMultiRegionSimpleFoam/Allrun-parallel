@@ -1,0 +1,13 @@
+#!/bin/sh
+cd "${0%/*}" || exit
+. ${WM_PROJECT_DIR:?}/bin/tools/RunFunctions
+
+./Allrun.pre
+
+runApplication -s shell_side_fluid decomposePar -region shell_side_fluid
+runApplication -s tube_side_fluid  decomposePar -region tube_side_fluid
+
+runParallel $(getApplication)
+
+runApplication -s shell_side_fluid reconstructPar -latestTime -region shell_side_fluid
+runApplication -s tube_side_fluid  reconstructPar -latestTime -region tube_side_fluid

@@ -34,16 +34,20 @@ cp salome_plugin/*.py salome_bridge.py ~/.config/salome/Plugins/
 ```
 
 ## Configure MCP Client
-It is recommended that you set up the mcp server inside a particular project, instead of globally.
+It is recommended that you set up the MCP server inside a particular project instead of globally.
 
 ### Claude Code CLI (from inside your project root)
 ```bash
 claude mcp add --scope project salome -- uv run --directory /path/to/salome-mcp salome-mcp
 ```
 
-### Codex CLI 
+### Codex CLI (from inside your project root)
 ```bash
-codex mcp add salome -- uv run --directory /path/to/salome-mcp salome-mcp
+mkdir -p .codex && cat > .codex/config.toml <<'EOF'
+[mcp_servers.salome]
+command = "uv"
+args = ["run", "--directory", "/path/to/salome-mcp", "salome-mcp"]
+EOF
 ```
 
 ### Custom Host and Port

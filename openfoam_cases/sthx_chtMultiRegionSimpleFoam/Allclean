@@ -1,0 +1,9 @@
+#!/bin/sh
+cd "${0%/*}" || exit
+. ${WM_PROJECT_DIR:?}/bin/tools/CleanFunctions
+
+cleanCase0
+foamCleanPolyMesh -region shell_side_fluid
+foamCleanPolyMesh -region tube_side_fluid
+rm -rf constant/polyMesh processor* postProcessing
+rm -f *.OpenFOAM

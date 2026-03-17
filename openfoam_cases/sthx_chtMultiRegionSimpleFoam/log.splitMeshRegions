@@ -1,0 +1,93 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _87ed40d2-20251219 OPENFOAM=2512 version=2512
+Arch   : "LSB;label=32;scalar=64"
+Exec   : splitMeshRegions -cellZonesOnly -overwrite
+Date   : Mar 12 2026
+Time   : 13:31:57
+Host   : fedora
+PID    : 703566
+I/O    : uncollated
+Case   : /home/babu/software/salome-mcp/openfoam_cases/sthx_chtMultiRegionSimpleFoam
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+memory pool : not available
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 0
+
+Creating single patch per inter-region interface.
+
+Using current cellZones to split mesh into regions. This requires all cells to be in one and only one cellZone.
+
+
+Number of regions:2
+
+Writing region per cell file (for manual decomposition) to "/home/babu/software/salome-mcp/openfoam_cases/sthx_chtMultiRegionSimpleFoam/constant/cellToRegion"
+
+Writing region per cell as volScalarField to "/home/babu/software/salome-mcp/openfoam_cases/sthx_chtMultiRegionSimpleFoam/0/cellToRegion"
+
+Region	Cells
+------	-----
+0	31091
+1	12803
+
+Region	Zone	Name
+------	----	----
+0	(0)	shell_side_fluid
+1	(1)	tube_side_fluid
+
+Sizes of interfaces between regions:
+
+Interface	Region	Region	Faces
+---------	------	------	-----
+0		0	1	6606
+
+Reading volScalarField: cellToRegion
+
+
+Adding patches
+
+
+Adding patches
+
+For interface between region shell_side_fluid and tube_side_fluid added patches
+    5	shell_side_fluid_to_tube_side_fluid
+    6	tube_side_fluid_to_shell_side_fluid
+
+Region 0
+-------- 
+Creating mesh for region 0 shell_side_fluid
+Mapping fields
+Mapping field cellToRegion
+Deleting empty patches
+Writing new mesh
+Writing addressing to base mesh
+Writing map pointRegionAddressing from region0 points back to base mesh.
+Writing map faceRegionAddressing from region0 faces back to base mesh.
+Writing map cellRegionAddressing from region0 cells back to base mesh.
+Writing map boundaryRegionAddressing from region0 boundary back to base mesh.
+
+Region 1
+-------- 
+Creating mesh for region 1 tube_side_fluid
+Mapping fields
+Mapping field cellToRegion
+Deleting empty patches
+Writing new mesh
+Writing addressing to base mesh
+Writing map pointRegionAddressing from region1 points back to base mesh.
+Writing map faceRegionAddressing from region1 faces back to base mesh.
+Writing map cellRegionAddressing from region1 cells back to base mesh.
+Writing map boundaryRegionAddressing from region1 boundary back to base mesh.
+End
+

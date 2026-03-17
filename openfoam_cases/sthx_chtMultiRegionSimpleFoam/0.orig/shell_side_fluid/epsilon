@@ -1,0 +1,19 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      epsilon;
+}
+
+dimensions      [0 2 -3 0 0 0 0];
+internalField   uniform 0.01;
+
+boundaryField
+{
+    shell_inlet  { type fixedValue; value uniform 0.01; }
+    shell_outlet { type zeroGradient; }
+    outer_wall   { type epsilonWallFunction; value uniform 0.01; }
+    ".*_to_.*"  { type epsilonWallFunction; value uniform 0.01; }
+    defaultFaces { type zeroGradient; }
+}
