@@ -9,3 +9,4 @@ __pycache__/
 # Project-local agent config
 .codex/
 .claude/
+.mcp.json
