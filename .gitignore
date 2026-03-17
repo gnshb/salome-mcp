@@ -9,10 +9,3 @@ __pycache__/
 # Project-local agent config
 .codex/
 .claude/
-.aider*
-.cline/
-.continue/
-.cursor/
-.gemini/
-.roo/
-.windsurf/
